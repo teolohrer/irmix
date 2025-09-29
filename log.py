@@ -10,7 +10,7 @@ console = Console()
 
 # Configure rich logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(name)s - %(message)s",
     datefmt="[%X]",
     handlers=[RichHandler(console=console, show_path=True, show_time=True)]

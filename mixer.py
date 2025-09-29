@@ -1,8 +1,9 @@
 from enum import Enum
 from pathlib import Path
-import pygame
+from log import get_logger, suppress_stdout_stderr
+with suppress_stdout_stderr():
+    import pygame
 import os
-from log import get_logger
 
 from song import Song, ORIGINAL
 

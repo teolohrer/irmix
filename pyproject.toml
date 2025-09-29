@@ -8,6 +8,7 @@ dependencies = [
     "demucs>=4.0.1",
     "pygame>=2.6.1",
     "rich>=14.1.0",
+    "setuptools<81",
     "soundfile>=0.13.1",
     "torchaudio>=2.8.0",
     "yt-dlp>=2025.9.26",
