@@ -191,23 +191,27 @@ class LiveMixer:
             self.console.print("\n[bold blue]🎵 Mixer stopped. Goodbye![/]\n")
 
 
-def extract_and_mix(youtube_url: str, extract_stems: bool = True):
-    """Extract stems from YouTube URL and start live mixer"""
+def extract_and_mix(youtube_url: str, extract_only: bool = False):
+    """Extract stems from YouTube URL and optionally start live mixer"""
     console = Console()
     
     try:
         console.print(f"\n[bold blue]🔗 Processing YouTube URL:[/] {youtube_url}")
         
         # Download audio
-        with console.status("[bold green]📥 Downloading audio...", spinner="dots"):
+        with console.status("[bold green]📥 Downloading audio...\n", spinner="dots"):
             song = Song.from_yt_url(youtube_url)
         console.print(f"[green]✓[/] Downloaded: [bold]{song.title}[/]")
         
-        # Extract stems if requested
-        if extract_stems:
-            with console.status("[bold yellow]🎵 Extracting stems (this may take a few minutes)...", spinner="bouncingBar"):
-                song.extract_stems()
-            console.print("[green]✓[/] Stems extracted successfully!")
+        # Extract stems
+        console.print("[bold yellow]🎵 Extracting stems (this may take a few minutes)...[/]")
+        song.extract_stems()
+        console.print("[green]✓[/] Stems extracted successfully!")
+        
+        # If extract_only is True, stop here
+        if extract_only:
+            console.print(f"[green]✓[/] Extract-only mode: Audio downloaded and stems extracted for [bold]{song.title}[/]")
+            return
         
         # Initialize mixer
         with console.status("[bold cyan]🎛️ Loading mixer...", spinner="dots"):
@@ -280,6 +284,18 @@ def list_available_songs():
     console.print()
 
 
+def is_youtube_url(url_or_path: str) -> bool:
+    """Check if the input is a YouTube URL"""
+    youtube_patterns = [
+        "youtube.com/watch",
+        "youtu.be/",
+        "youtube.com/embed/",
+        "youtube.com/v/",
+        "m.youtube.com/watch"
+    ]
+    return any(pattern in url_or_path.lower() for pattern in youtube_patterns)
+
+
 def main():
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
@@ -287,11 +303,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract stems from YouTube URL and start mixer
-  python main.py --extract https://www.youtube.com/watch?v=VIDEO_ID
+  # Download, extract stems, and start mixer (default behavior)
+  python main.py https://www.youtube.com/watch?v=VIDEO_ID
+  
+  # Only download audio and extract stems (no mixer)
+  python main.py https://www.youtube.com/watch?v=VIDEO_ID --extract
   
   # Mix existing stem folder
-  python main.py --mix songs/SONG_NAME
+  python main.py songs/SONG_NAME
   
   # List available songs
   python main.py --list-songs
@@ -301,19 +320,13 @@ Examples:
     parser.add_argument(
         "url_or_path",
         nargs="?",
-        help="YouTube URL (for --extract) or path to song directory (for --mix)"
+        help="YouTube URL or path to existing song directory"
     )
     
     parser.add_argument(
         "--extract",
         action="store_true",
-        help="Download YouTube audio and extract stems"
-    )
-    
-    parser.add_argument(
-        "--mix",
-        action="store_true", 
-        help="Mix existing stem folder"
+        help="Extract-only mode: download audio and extract stems without launching mixer"
     )
     
     parser.add_argument(
@@ -334,20 +347,15 @@ Examples:
         parser.print_help()
         sys.exit(1)
     
-    # Check that exactly one operation is specified
-    if args.extract and args.mix:
-        print("❌ Error: Cannot use both --extract and --mix at the same time")
-        sys.exit(1)
-    
-    if not args.extract and not args.mix:
-        print("❌ Error: Must specify either --extract or --mix")
-        parser.print_help()
-        sys.exit(1)
-    
-    # Execute the requested operation
-    if args.extract:
-        extract_and_mix(args.url_or_path, extract_stems=True)
-    elif args.mix:
+    # Determine if input is YouTube URL or local path
+    if is_youtube_url(args.url_or_path):
+        # YouTube URL - download and extract stems
+        extract_and_mix(args.url_or_path, extract_only=args.extract)
+    else:
+        # Local path - mix existing stems
+        if args.extract:
+            print("❌ Error: --extract flag can only be used with YouTube URLs")
+            sys.exit(1)
         mix_existing(args.url_or_path)
 
 
