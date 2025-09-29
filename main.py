@@ -1,13 +1,17 @@
+#!/usr/bin/env python3
+"""
+IRMix - YouTube Audio Stem Extractor and Live Mixer
+A simple tool to extract stems from YouTube videos and mix them live.
+"""
+
+import argparse
+import sys
 import threading
 import time
-import logging
-import sys
 import select
-import tty
 import termios
+import tty
 from pathlib import Path
-from typing import Optional
-from collections import deque
 
 from rich.console import Console
 from rich.panel import Panel
@@ -15,435 +19,331 @@ from rich.table import Table
 from rich.layout import Layout
 from rich.live import Live
 from rich.text import Text
-from rich.prompt import Prompt, Confirm
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.align import Align
-from rich.columns import Columns
+from rich import box
 
 from song import Song
-from mixer import TrackMixer, PlaybackStatus
+from mixer import TrackMixer
 from log import get_logger
 
 logger = get_logger(__name__)
 
-class LogCapture(logging.Handler):
-    """Custom logging handler to capture logs for display"""
-    def __init__(self, max_logs=10):
-        super().__init__()
-        self.logs = deque(maxlen=max_logs)
-        
-    def emit(self, record):
-        log_entry = self.format(record)
-        self.logs.append(log_entry)
-
-class MixerApp:
+class KeyboardInput:
+    """Non-blocking keyboard input handler for macOS/Linux"""
+    
     def __init__(self):
+        self.old_settings = None
+        
+    def __enter__(self):
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setraw(sys.stdin.fileno())
+        return self
+        
+    def __exit__(self, type, value, traceback):
+        if self.old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+    
+    def get_char(self, timeout=0.1):
+        """Get a single character with timeout"""
+        if select.select([sys.stdin], [], [], timeout) == ([sys.stdin], [], []):
+            return sys.stdin.read(1)
+        return None
+
+class LiveMixer:
+    """Rich console live mixing interface"""
+    
+    def __init__(self, mixer: TrackMixer):
+        self.mixer = mixer
+        self.running = False
+        self.tracks = [track for track in mixer.list_tracks() if track != 'original']
         self.console = Console()
-        self.mixer: Optional[TrackMixer] = None
-        self.current_song: Optional[Song] = None
-        self.running = True
-        self.layout = Layout()
+        self.last_command = ""
         
-        # Setup log capture
-        self.log_capture = LogCapture(max_logs=8)
-        self.log_capture.setFormatter(logging.Formatter('%(name)s - %(message)s'))
-        logging.getLogger().addHandler(self.log_capture)
+    def create_interface(self):
+        """Create the rich interface layout"""
+        # Status panel
+        status_color = "green" if self.mixer.status.value == 'playing' else "yellow" if self.mixer.status.value == 'paused' else "red"
+        status_text = Text(f"Status: {self.mixer.status.value.upper()}", style=f"bold {status_color}")
         
-        self.setup_layout()
+        # Stems table
+        table = Table(box=box.ROUNDED, show_header=True, header_style="bold blue")
+        table.add_column("Key", style="cyan", width=5)
+        table.add_column("Stem", style="white", width=12)
+        table.add_column("Status", width=10)
         
-    def setup_layout(self):
-        """Setup the Rich layout structure"""
-        self.layout.split_column(
-            Layout(name="header", size=3),
-            Layout(name="main"),
-            Layout(name="footer", size=3)
-        )
+        for i, track in enumerate(self.tracks, 1):
+            muted = self.mixer.is_muted(track)
+            status_style = "red" if muted else "green"
+            status_text_val = "MUTED" if muted else "PLAYING"
+            table.add_row(
+                str(i),
+                track.capitalize(),
+                Text(status_text_val, style=f"bold {status_style}")
+            )
         
-        self.layout["main"].split_row(
-            Layout(name="controls", ratio=2),
-            Layout(name="right", ratio=1)
-        )
-        
-        self.layout["right"].split_column(
-            Layout(name="status", ratio=1),
-            Layout(name="logs", ratio=1)
-        )
-
-    def create_header(self) -> Panel:
-        """Create the header panel"""
-        title = Text("🎵 IRMIX - Interactive Music Mixer", style="bold magenta")
-        return Panel(Align.center(title), style="bright_blue")
-
-    def create_footer(self) -> Panel:
-        """Create the footer with controls"""
+        # Controls panel
         controls = Text()
-        controls.append("Press: ", style="bold")
-        controls.append("P", style="green")
-        controls.append("=Play/Pause  ", style="white")
-        controls.append("S", style="red")
-        controls.append("=Stop  ", style="white")
-        controls.append("R", style="yellow")
-        controls.append("=Rewind  ", style="white")
-        controls.append("1-4", style="cyan")
-        controls.append("=Toggle Stems  ", style="white")
-        controls.append("Q", style="magenta")
-        controls.append("=Quit", style="white")
+        controls.append("Controls: ", style="bold white")
+        controls.append("SPACE", style="bold cyan")
+        controls.append(" Play/Pause  ", style="white")
+        controls.append("s", style="bold cyan")
+        controls.append(" Stop  ", style="white")
+        controls.append("r", style="bold cyan")
+        controls.append(" Rewind  ", style="white")
+        controls.append("q", style="bold cyan")
+        controls.append(" Quit  ", style="white")
+        controls.append("1-4", style="bold cyan")
+        controls.append(" Toggle stems", style="white")
         
-        return Panel(Align.center(controls), style="dim")
-
-    def create_mixer_controls(self) -> Panel:
-        """Create the mixer controls panel"""
-        if not self.mixer:
-            return Panel("No song loaded", title="Mixer Controls", style="dim")
-            
-        table = Table(show_header=True, header_style="bold magenta", box=None)
-        table.add_column("Stem", style="cyan", width=10)
-        table.add_column("Status", width=12)
-        table.add_column("Key", width=5)
+        # Create panels
+        status_panel = Panel(status_text, title="Playback", border_style="blue")
+        stems_panel = Panel(table, title="Stems", border_style="green")
+        controls_panel = Panel(controls, title="Controls", border_style="yellow")
         
-        stems = ["vocals", "drums", "bass", "other"]
-        keys = ["1", "2", "3", "4"]
+        # Feedback panel
+        feedback_text = Text(self.last_command if self.last_command else " ", style="dim")
+        feedback_panel = Panel(feedback_text, title="Last Action", border_style="dim", height=3)
         
-        for i, (stem, key) in enumerate(zip(stems, keys)):
-            if stem in self.mixer.tracks:
-                is_muted = self.mixer.is_muted(stem)
-                status = "🔇 MUTED" if is_muted else "🔊 ACTIVE"
-                status_style = "red" if is_muted else "green"
-                
-                table.add_row(
-                    stem.capitalize(),
-                    Text(status, style=status_style),
-                    f"[{key}]"
-                )
+        # Layout
+        layout = Layout()
+        layout.split_column(
+            Layout(status_panel, size=3),
+            Layout(stems_panel, size=len(self.tracks) + 4),
+            Layout(controls_panel, size=3),
+            Layout(feedback_panel, size=3)
+        )
         
-        return Panel(table, title="🎛️ Mixer Controls", style="bright_blue")
-
-    def create_status_panel(self) -> Panel:
-        """Create the status panel"""
-        if not self.mixer or not self.current_song:
-            return Panel("No song loaded", title="Status", style="dim")
-            
-        # Playback status
-        status_color = {
-            PlaybackStatus.PLAYING: "green",
-            PlaybackStatus.PAUSED: "yellow", 
-            PlaybackStatus.STOPPED: "red"
-        }
+        return layout
         
-        table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column("Label", style="bold", width=8)
-        table.add_column("Value", width=15)
-        
-        table.add_row("Song:", self.current_song.title[:15] + "..." if len(self.current_song.title) > 15 else self.current_song.title)
-        table.add_row("Status:", Text(
-            self.mixer.status.value.upper(), 
-            style=status_color.get(self.mixer.status, "white")
-        ))
-        table.add_row("Tracks:", str(len(self.mixer.tracks)))
-        
-        return Panel(table, title="📊 Status", style="bright_green")
-
-    def create_logs_panel(self) -> Panel:
-        """Create the logs panel"""
-        if not self.log_capture.logs:
-            return Panel("No logs yet", title="📝 Logs", style="dim")
-        
-        log_text = Text()
-        for log_entry in list(self.log_capture.logs)[-6:]:  # Show last 6 logs
-            # Truncate long log entries
-            if len(log_entry) > 40:
-                log_entry = log_entry[:37] + "..."
-            log_text.append(log_entry + "\n", style="dim")
-        
-        return Panel(log_text, title="📝 Logs", style="yellow")
-
-    def update_display(self):
-        """Update the display layout"""
-        self.layout["header"].update(self.create_header())
-        self.layout["controls"].update(self.create_mixer_controls())
-        self.layout["status"].update(self.create_status_panel())
-        self.layout["logs"].update(self.create_logs_panel())
-        self.layout["footer"].update(self.create_footer())
-
-    def list_songs(self) -> list[Path]:
-        """List available songs in the songs directory"""
-        songs_dir = Path("songs")
-        if not songs_dir.exists():
-            songs_dir.mkdir(parents=True)
-            return []
-        return [p for p in songs_dir.iterdir() if p.is_dir()]
-
-    def select_existing_song(self) -> Optional[Song]:
-        """Let user select from existing songs"""
-        songs = self.list_songs()
-        
-        if not songs:
-            self.console.print("❌ No existing songs found in the songs directory.", style="red")
-            return None
-            
-        self.console.print("\n📁 Available Songs:", style="bold cyan")
-        table = Table(show_header=True, header_style="bold magenta")
-        table.add_column("Index", style="cyan", width=8)
-        table.add_column("Song Title", style="green")
-        
-        for i, song_path in enumerate(songs, 1):
-            table.add_row(str(i), song_path.name)
-            
-        self.console.print(table)
-        
-        while True:
-            try:
-                choice = Prompt.ask(
-                    "\nSelect a song by number (or 'q' to go back)",
-                    default="q"
-                )
-                
-                if choice.lower() == 'q':
-                    return None
-                    
-                index = int(choice) - 1
-                if 0 <= index < len(songs):
-                    selected_path = songs[index]
-                    self.console.print(f"✅ Loading song: {selected_path.name}", style="green")
-                    return Song.from_path(selected_path)
-                else:
-                    self.console.print("❌ Invalid selection. Please try again.", style="red")
-                    
-            except ValueError:
-                self.console.print("❌ Please enter a valid number.", style="red")
-
-    def load_song_from_youtube(self) -> Optional[Song]:
-        """Load a new song from YouTube URL"""
-        self.console.print("\n🎬 Load Song from YouTube", style="bold cyan")
-        
-        url = Prompt.ask("Enter YouTube URL (or 'q' to go back)")
-        
-        if url.lower() == 'q':
-            return None
-            
-        try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=self.console
-            ) as progress:
-                task = progress.add_task("Downloading and processing...", total=None)
-                
-                # Download and create song
-                song = Song.from_yt_url(url)
-                progress.update(task, description="Extracting stems...")
-                song.extract_stems()
-                
-            self.console.print(f"✅ Successfully loaded: {song.title}", style="green")
-            return song
-            
-        except Exception as e:
-            self.console.print(f"❌ Error loading song: {str(e)}", style="red")
-            logger.error(f"Error loading song from YouTube: {e}")
-            return None
-
-    def song_selection_menu(self) -> Optional[Song]:
-        """Show song selection menu"""
-        while True:
-            self.console.clear()
-            self.console.print(Panel.fit("🎵 Song Selection", style="bold magenta"))
-            
-            choices = [
-                "1. Select existing song",
-                "2. Load new song from YouTube",
-                "3. Back to main menu"
-            ]
-            
-            for choice in choices:
-                self.console.print(f"  {choice}")
-                
-            selection = Prompt.ask("\nChoose an option", choices=["1", "2", "3"], default="3")
-            
-            if selection == "1":
-                song = self.select_existing_song()
-                if song:
-                    return song
-            elif selection == "2":
-                song = self.load_song_from_youtube()
-                if song:
-                    return song
-            elif selection == "3":
-                return None
-
-    def handle_mixer_command(self, command: str):
-        """Handle mixer commands"""
-        if not self.mixer:
-            return
-            
-        command = command.lower().strip()
-        
-        if command in ['p', 'play', 'pause']:
-            if self.mixer.status == PlaybackStatus.PLAYING:
-                self.mixer.pause()
-            elif self.mixer.status == PlaybackStatus.PAUSED:
-                self.mixer.resume()
-            else:
-                self.mixer.play()
-        elif command in ['s', 'stop']:
-            self.mixer.stop()
-        elif command in ['r', 'rewind']:
-            self.mixer.rewind_all()
-        elif command in ['1', '2', '3', '4']:
-            stems = ["vocals", "drums", "bass", "other"]
-            stem_index = int(command) - 1
-            if stem_index < len(stems):
-                stem = stems[stem_index]
-                if stem in self.mixer.tracks:
-                    self.mixer.toggle_mute(stem)
-        elif command in ['q', 'quit']:
-            self.running = False
-
-    def handle_keyboard_input(self):
-        """Handle direct keyboard input in a separate thread"""
-        # Save terminal settings
-        old_settings = termios.tcgetattr(sys.stdin)
-        
-        try:
-            tty.setraw(sys.stdin.fileno())
-            
-            while self.running:
-                if select.select([sys.stdin], [], [], 0.1)[0]:
-                    key = sys.stdin.read(1).lower()
-                    
-                    if not self.mixer:
-                        continue
-                        
-                    if key == 'p':
-                        if self.mixer.status == PlaybackStatus.PLAYING:
-                            self.mixer.pause()
-                        elif self.mixer.status == PlaybackStatus.PAUSED:
-                            self.mixer.resume()
-                        else:
-                            self.mixer.play()
-                    elif key == 's':
-                        self.mixer.stop()
-                    elif key == 'r':
-                        self.mixer.rewind_all()
-                    elif key in '1234':
-                        stems = ["vocals", "drums", "bass", "other"]
-                        stem_index = int(key) - 1
-                        if stem_index < len(stems):
-                            stem = stems[stem_index]
-                            if stem in self.mixer.tracks:
-                                self.mixer.toggle_mute(stem)
-                    elif key == 'q':
-                        self.running = False
-                        break
-                        
-        except Exception:
-            # Fallback if keyboard handling fails
-            pass
-        finally:
-            # Restore terminal settings
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-    def run_mixer(self):
-        """Run the interactive mixer"""
-        if not self.mixer or not self.current_song:
-            self.console.print("❌ No song loaded!", style="red")
-            return
-            
-        self.console.clear()
+    def run(self):
+        """Run the rich console mixing interface"""
         self.running = True
         
-        # Start playback
-        self.mixer.play()
-        
-        # Start keyboard input handler in separate thread
-        input_thread = threading.Thread(target=self.handle_keyboard_input, daemon=True)
-        input_thread.start()
+        # Suppress mixer logs during interface
+        import logging
+        mixer_logger = logging.getLogger('mixer')
+        original_level = mixer_logger.level
+        mixer_logger.setLevel(logging.WARNING)
         
         try:
-            with Live(self.layout, console=self.console, refresh_per_second=4) as live:
-                while self.running:
-                    self.update_display()
-                    time.sleep(0.25)
-                    
-        except KeyboardInterrupt:
-            self.running = False
-            
-        finally:
-            if self.mixer:
-                self.mixer.stop()
-
-    def main_menu(self):
-        """Show the main menu"""
-        while True:
             self.console.clear()
+            self.console.print(Panel.fit("🎵 IRMix Live Mixer", style="bold magenta"))
+            self.console.print("Starting playback... Press keys for real-time control!", style="green")
             
-            # Title
-            title = Panel.fit("🎵 IRMIX - Interactive Music Mixer", style="bold magenta")
-            self.console.print(title)
-            self.console.print()
+            self.mixer.play()
             
-            # Current song status
-            if self.current_song:
-                status = f"✅ Current song: {self.current_song.title}"
-                self.console.print(Panel(status, style="green"))
-            else:
-                self.console.print(Panel("❌ No song loaded", style="red"))
-            
-            self.console.print()
-            
-            # Menu options
-            options = [
-                "1. Select/Load Song",
-                "2. Start Mixer" + (" (song loaded)" if self.current_song else " (no song)"),
-                "3. Quit"
-            ]
-            
-            for option in options:
-                style = "green" if "song loaded" in option else "white"
-                if "no song" in option:
-                    style = "dim"
-                self.console.print(f"  {option}", style=style)
-            
-            choice = Prompt.ask("\nChoose an option", choices=["1", "2", "3"], default="3")
-            
-            if choice == "1":
-                song = self.song_selection_menu()
-                if song:
-                    self.current_song = song
-                    self.mixer = TrackMixer.from_song(song)
-                    self.console.print(f"✅ Song loaded: {song.title}", style="green")
-                    time.sleep(1)
-                    
-            elif choice == "2":
-                if self.current_song and self.mixer:
-                    self.run_mixer()
-                else:
-                    self.console.print("❌ Please load a song first!", style="red")
-                    time.sleep(2)
-                    
-            elif choice == "3":
-                if Confirm.ask("Are you sure you want to quit?"):
-                    break
-
-    def run(self):
-        """Run the application"""
-        try:
-            self.console.print("🎵 Welcome to IRMIX!", style="bold magenta")
-            self.main_menu()
-        except KeyboardInterrupt:
-            pass
+            with KeyboardInput() as kb:
+                with Live(self.create_interface(), console=self.console, refresh_per_second=10) as live:
+                    while self.running:
+                        try:
+                            # Update the interface
+                            live.update(self.create_interface())
+                            
+                            # Get keyboard input (non-blocking)
+                            char = kb.get_char(timeout=0.1)
+                            
+                            if char:
+                                if char.lower() == 'q':
+                                    break
+                                elif char == ' ':  # Space bar
+                                    if self.mixer.status.value == 'playing':
+                                        self.mixer.pause()
+                                        self.last_command = "⏸️  Paused"
+                                    else:
+                                        if self.mixer.status.value == 'paused':
+                                            self.mixer.resume()
+                                        else:
+                                            self.mixer.play()
+                                        self.last_command = "▶️  Playing"
+                                elif char.lower() == 's':
+                                    self.mixer.stop()
+                                    self.last_command = "⏹️  Stopped"
+                                elif char.lower() == 'r':
+                                    self.mixer.rewind_all()
+                                    self.last_command = "⏪ Rewound"
+                                elif char.isdigit():
+                                    track_num = int(char)
+                                    if 1 <= track_num <= len(self.tracks):
+                                        track_name = self.tracks[track_num - 1]
+                                        self.mixer.toggle_mute(track_name)
+                                        muted = self.mixer.is_muted(track_name)
+                                        status = "🔇 muted" if muted else "🔊 unmuted"
+                                        self.last_command = f"{track_name.capitalize()} {status}"
+                                    else:
+                                        self.last_command = f"❌ Invalid track number. Use 1-{len(self.tracks)}"
+                                elif char == '\x03':  # Ctrl+C
+                                    break
+                            
+                            # Clear last command after a few seconds
+                            if hasattr(self, '_last_command_time'):
+                                if time.time() - self._last_command_time > 2:
+                                    self.last_command = ""
+                            
+                            if self.last_command and not hasattr(self, '_last_command_time'):
+                                self._last_command_time = time.time()
+                            elif not self.last_command:
+                                if hasattr(self, '_last_command_time'):
+                                    delattr(self, '_last_command_time')
+                            
+                        except KeyboardInterrupt:
+                            break
+                        
         finally:
-            if self.mixer:
-                self.mixer.stop()
-            # Remove log handler
-            logging.getLogger().removeHandler(self.log_capture)
-            self.console.print("\n👋 Thanks for using IRMIX!", style="bold cyan")
+            # Restore logger level
+            mixer_logger.setLevel(original_level)
+            self.running = False
+            self.mixer.stop()
+            self.console.clear()
+            self.console.print(Panel.fit("🎵 Mixer stopped. Goodbye!", style="bold red"))
 
+def extract_and_mix(youtube_url: str, extract_stems: bool = True):
+    """Extract stems from YouTube URL and start live mixer"""
+    console = Console()
+    
+    try:
+        console.print(f"[bold blue]Processing YouTube URL:[/] {youtube_url}")
+        
+        # Create song from YouTube URL
+        with console.status("[bold green]Downloading audio...", spinner="dots"):
+            song = Song.from_yt_url(youtube_url)
+        console.print(f"[green]✓[/] Downloaded: [bold]{song.title}[/]")
+        
+        if extract_stems:
+            with console.status("[bold yellow]Extracting stems (this may take a few minutes)...", spinner="bouncingBar"):
+                song.extract_stems()
+            console.print("[green]✓[/] Stems extracted successfully!")
+        
+        # Create mixer from song
+        with console.status("[bold cyan]Loading mixer...", spinner="dots"):
+            mixer = TrackMixer.from_song(song)
+        
+        if not mixer.list_tracks():
+            console.print("[red]✗[/] Error: No tracks loaded!")
+            return
+            
+        console.print(f"[green]✓[/] Loaded tracks: [bold]{', '.join(mixer.list_tracks())}[/]")
+        
+        # Start live mixer
+        live_mixer = LiveMixer(mixer)
+        live_mixer.run()
+        
+    except Exception as e:
+        logger.error(f"Error processing YouTube URL: {e}")
+        console.print(f"[red]✗ Error:[/] {e}")
+        sys.exit(1)
+
+def mix_existing(song_path: str):
+    """Mix existing song directory"""
+    console = Console()
+    
+    try:
+        path = Path(song_path)
+        if not path.exists():
+            console.print(f"[red]✗ Error:[/] Path {song_path} does not exist")
+            sys.exit(1)
+            
+        with console.status(f"[bold cyan]Loading song from: {song_path}...", spinner="dots"):
+            song = Song.from_path(path)
+        
+        # Create mixer from song
+        with console.status("[bold cyan]Initializing mixer...", spinner="dots"):
+            mixer = TrackMixer.from_song(song)
+        
+        if not mixer.list_tracks():
+            console.print("[red]✗[/] Error: No tracks loaded!")
+            return
+            
+        console.print(f"[green]✓[/] Loaded tracks: [bold]{', '.join(mixer.list_tracks())}[/]")
+        
+        # Start live mixer
+        live_mixer = LiveMixer(mixer)
+        live_mixer.run()
+        
+    except Exception as e:
+        logger.error(f"Error loading song: {e}")
+        console.print(f"[red]✗ Error:[/] {e}")
+        sys.exit(1)
 
 def main():
-    """Main entry point"""
-    app = MixerApp()
-    app.run()
-
+    """Main CLI entry point"""
+    parser = argparse.ArgumentParser(
+        description="IRMix - YouTube Audio Stem Extractor and Live Mixer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Extract stems from YouTube URL (download + separate stems)
+  python main.py --extract https://www.youtube.com/watch?v=VIDEO_ID
+  
+  # Mix existing stem folder
+  python main.py --mix songs/SONG_NAME
+  
+  # List available songs
+  python main.py --list-songs
+        """
+    )
+    
+    parser.add_argument(
+        "url_or_path",
+        nargs="?",
+        help="YouTube URL (for --extract) or path to existing song directory (for --mix)"
+    )
+    
+    parser.add_argument(
+        "--extract",
+        action="store_true",
+        help="Download YouTube audio and extract stems"
+    )
+    
+    parser.add_argument(
+        "--mix",
+        action="store_true",
+        help="Mix existing stem folder"
+    )
+    
+    parser.add_argument(
+        "--list-songs",
+        action="store_true",
+        help="List available songs in the songs directory"
+    )
+    
+    args = parser.parse_args()
+    
+    # List songs option
+    if args.list_songs:
+        console = Console()
+        songs_dir = Path("songs")
+        if songs_dir.exists():
+            songs = [d.name for d in songs_dir.iterdir() if d.is_dir()]
+            if songs:
+                console.print("[bold blue]Available songs:[/]")
+                for song in sorted(songs):
+                    console.print(f"  [green]•[/] {song}")
+            else:
+                console.print("[yellow]No songs found in songs directory[/]")
+        else:
+            console.print("[red]Songs directory does not exist[/]")
+        return
+    
+    # Require URL or path for other operations
+    if not args.url_or_path:
+        parser.print_help()
+        sys.exit(1)
+    
+    # Check that exactly one operation is specified
+    if args.extract and args.mix:
+        print("Error: Cannot use both --extract and --mix at the same time")
+        sys.exit(1)
+    
+    if not args.extract and not args.mix:
+        print("Error: Must specify either --extract or --mix")
+        parser.print_help()
+        sys.exit(1)
+    
+    if args.extract:
+        # Extract stems from YouTube URL
+        extract_and_mix(args.url_or_path, extract_stems=True)
+    elif args.mix:
+        # Mix existing song directory
+        mix_existing(args.url_or_path)
 
 if __name__ == "__main__":
     main()
